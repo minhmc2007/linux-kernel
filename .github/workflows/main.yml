@@ -1,16 +1,23 @@
 name: Build Arch Linux Kernel
 
 on:
+  # 1. This still triggers automatically when you push a new tag
   push:
     tags:
       - 'v*'
+  
+  # 2. This is the manual trigger, now with an input field
   workflow_dispatch:
+    inputs:
+      git_ref:
+        description: 'The tag, branch, or commit SHA to build'
+        required: true
+        # Defaults to the main branch if you run it manually
+        default: 'main'
 
 env:
-  # This will be set dynamically in the 'Determine Kernel Version' step
-  KERNEL_VERSION: 'unknown'
-  # The release tag is now simpler, based on the git ref
-  RELEASE_TAG: ${{ github.ref_name || 'kernel-build' }}
+  # Prioritize the manual input, otherwise use the git ref that triggered the run
+  RELEASE_TAG: ${{ github.event.inputs.git_ref || github.ref_name }}
 
 jobs:
   build-kernel:
@@ -19,28 +26,27 @@ jobs:
       image: archlinux:latest
     
     steps:
+    # 3. This is the key change for manual runs
     - name: Checkout Kernel Source
       uses: actions/checkout@v4
-      # Use a depth of 0 to get all history, which can be useful for versioning
       with:
+        # This tells checkout to use the tag/branch from the input field
+        ref: ${{ github.event.inputs.git_ref || github.ref }}
+        # Fetch all history so 'make kernelrelease' works correctly
         fetch-depth: 0
 
     - name: Initialize Arch Linux environment
       run: |
         pacman -Syu --noconfirm
-        pacman -S --noconfirm base-devel git wget curl bc kmod inetutils xmlto python-sphinx python-sphinx_rtd_theme graphviz imagemagick
+        pacman -S --noconfirm base-devel git curl bc kmod inetutils xmlto python-sphinx python-sphinx_rtd_theme graphviz imagemagick
         pacman -S --noconfirm linux-headers pahole cpio perl tar xz libelf python-yaml
 
     - name: Setup build environment
       run: |
         useradd -m builder
         echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
-        
-        # Copy the checked-out source to the builder's home directory
-        # This is the correct way to handle permissions with the workspace
         cp -a . /home/builder/repo
         chown -R builder:builder /home/builder/repo
-        
         pacman -S --noconfirm ccache
         mkdir -p /home/builder/.ccache
         chown -R builder:builder /home/builder/.ccache
@@ -53,32 +59,22 @@ jobs:
           cd /home/builder/repo
           
           echo '--- Configuring Kernel ---'
-          # Use existing .config if present, otherwise create a default one
           if [ -f .config ]; then
             echo 'Using existing .config file.'
-            make olddefconfig
           else
             echo 'No .config found, creating default.'
             zcat /proc/config.gz > .config 2>/dev/null || make defconfig
           fi
-
-          # Update config for the current kernel version
-          make olddefconfig
           
-          # Apply any custom settings
-          echo '--- Applying Custom Settings ---'
+          make olddefconfig
           scripts/config --enable CONFIG_IKCONFIG
           scripts/config --enable CONFIG_IKCONFIG_PROC
           scripts/config --set-str CONFIG_LOCALVERSION '-custom'
-          
-          # Apply the final configuration
           make olddefconfig
           
-          # Determine the final kernel version string AFTER configuration
           FINAL_KERNEL_VERSION=\$(make -s kernelrelease)
           echo \"Final Kernel release version will be: \$FINAL_KERNEL_VERSION\"
           
-          # Export the version for other steps
           echo \"KERNEL_VERSION=\$FINAL_KERNEL_VERSION\" | sudo tee -a \$GITHUB_ENV > /dev/null
           echo \"kernel_version_output=\$FINAL_KERNEL_VERSION\" | sudo tee -a \$GITHUB_OUTPUT > /dev/null
         "
@@ -88,17 +84,10 @@ jobs:
         su - builder -c "
           set -e
           cd /home/builder/repo
-          
           NPROC=\$(nproc)
           echo \"Building with \$NPROC parallel jobs...\"
-          
-          # Build kernel, modules, and install them to a temporary directory
           make -j\$NPROC
-          
-          echo \"Installing modules to /tmp/kernel-install...\"
           sudo make INSTALL_MOD_PATH=/tmp/kernel-install modules_install
-          
-          echo \"Copying kernel artifacts...\"
           sudo mkdir -p /tmp/kernel-install/boot
           sudo cp arch/x86/boot/bzImage /tmp/kernel-install/boot/vmlinuz-${{ steps.config_and_version.outputs.kernel_version_output }}
           sudo cp System.map /tmp/kernel-install/boot/System.map-${{ steps.config_and_version.outputs.kernel_version_output }}
@@ -109,16 +98,10 @@ jobs:
       run: |
         set -e
         cd /tmp/kernel-install
-        
-        # The kernel version is now reliably set in the environment
         echo "Packaging kernel version: ${{ env.KERNEL_VERSION }}"
-        
-        # Create compressed archive directly in the shared workspace
         tar -czf /github/workspace/arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz .
-        
         cd /github/workspace
         sha256sum arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz > arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz.sha256
-        
         echo "KERNEL_PACKAGE=arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz" >> $GITHUB_ENV
         echo "KERNEL_CHECKSUM=arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz.sha256" >> $GITHUB_ENV
 
@@ -134,16 +117,10 @@ jobs:
           ## Arch Linux Kernel Build
           
           **Kernel Version:** `${{ env.KERNEL_VERSION }}`
-          **Git Tag:** `${{ env.RELEASE_TAG }}`
+          **Git Ref Built:** `${{ env.RELEASE_TAG }}`
           **Commit:** `${{ github.sha }}`
           
-          ### Installation Instructions
-          
-          1. Download the kernel package (`arch-kernel-*.tar.gz`).
-          2. Verify the checksum with the provided `.sha256` file.
-          3. Extract the archive to root: `sudo tar -xzf arch-kernel-*.tar.gz -C /`
-          4. Update your bootloader (e.g., `sudo grub-mkconfig -o /boot/grub/grub.cfg`).
-          5. Reboot and select the new kernel.
+          Built using the workflow from the `main` branch.
         draft: false
         prerelease: true
 
@@ -171,5 +148,6 @@ jobs:
       run: |
         echo "## ✅ Build Summary" >> $GITHUB_STEP_SUMMARY
         echo "- **Kernel Version:** ${{ env.KERNEL_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Git Ref Built:** ${{ env.RELEASE_TAG }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Package:** ${{ env.KERNEL_PACKAGE }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Release:** [${{ env.RELEASE_TAG }}](${{ steps.create_release.outputs.html_url }})" >> $GITHUB_STEP_SUMMARY
