@@ -5,20 +5,12 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
-    inputs:
-      kernel_version:
-        description: 'Kernel version to build (e.g., 6.6.1)'
-        required: false
-        default: 'latest'
-      release_tag:
-        description: 'Release tag name'
-        required: false
-        default: 'kernel-build'
 
 env:
-  # This gets updated in the 'Get kernel source' step if 'latest' is used
-  KERNEL_VERSION: ${{ github.event.inputs.kernel_version || 'latest' }}
-  RELEASE_TAG: ${{ github.event.inputs.release_tag || github.ref_name || 'kernel-build' }}
+  # This will be set dynamically in the 'Determine Kernel Version' step
+  KERNEL_VERSION: 'unknown'
+  # The release tag is now simpler, based on the git ref
+  RELEASE_TAG: ${{ github.ref_name || 'kernel-build' }}
 
 jobs:
   build-kernel:
@@ -27,145 +19,108 @@ jobs:
       image: archlinux:latest
     
     steps:
-    - name: Checkout repository
+    - name: Checkout Kernel Source
       uses: actions/checkout@v4
+      # Use a depth of 0 to get all history, which can be useful for versioning
+      with:
+        fetch-depth: 0
 
     - name: Initialize Arch Linux environment
       run: |
-        # Update system and install base development tools
         pacman -Syu --noconfirm
         pacman -S --noconfirm base-devel git wget curl bc kmod inetutils xmlto python-sphinx python-sphinx_rtd_theme graphviz imagemagick
-        
-        # Install kernel build dependencies
         pacman -S --noconfirm linux-headers pahole cpio perl tar xz libelf python-yaml
 
     - name: Setup build environment
       run: |
-        # Create build user
         useradd -m builder
         echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
         
-        # Copy source to builder's home and set ownership
-        # This avoids issues with chown on the mounted /github/workspace
+        # Copy the checked-out source to the builder's home directory
+        # This is the correct way to handle permissions with the workspace
         cp -a . /home/builder/repo
         chown -R builder:builder /home/builder/repo
         
-        # Setup ccache for faster builds
         pacman -S --noconfirm ccache
         mkdir -p /home/builder/.ccache
         chown -R builder:builder /home/builder/.ccache
 
-    - name: Get kernel source
+    - name: Configure kernel and Determine Version
+      id: config_and_version
       run: |
-        # Run commands as the 'builder' user inside their home directory
         su - builder -c "
           set -e
           cd /home/builder/repo
           
-          if [ '${{ env.KERNEL_VERSION }}' = 'latest' ]; then
-            # Get latest stable kernel version
-            LATEST_VERSION=\$(curl -s https://www.kernel.org/releases.json | grep -oP '\"version\":\s*\"\K[^\"]*' | head -1)
-            # Use sudo to write to GITHUB_ENV from the non-root user
-            echo \"KERNEL_VERSION=\$LATEST_VERSION\" | sudo tee -a \$GITHUB_ENV > /dev/null
-            echo \"Building latest kernel version: \$LATEST_VERSION\"
-            # Set variable for this step
-            KERNEL_VER_TO_BUILD=\$LATEST_VERSION
+          echo '--- Configuring Kernel ---'
+          # Use existing .config if present, otherwise create a default one
+          if [ -f .config ]; then
+            echo 'Using existing .config file.'
+            make olddefconfig
           else
-            echo \"Building specified kernel version: ${{ env.KERNEL_VERSION }}\"
-            # Set variable for this step
-            KERNEL_VER_TO_BUILD='${{ env.KERNEL_VERSION }}'
+            echo 'No .config found, creating default.'
+            zcat /proc/config.gz > .config 2>/dev/null || make defconfig
           fi
-          
-          # Download kernel source
-          KERNEL_VER=\$(echo \"\$KERNEL_VER_TO_BUILD\" | sed 's/v//')
-          MAJOR_VER=\$(echo \$KERNEL_VER | cut -d. -f1)
-          
-          wget https://cdn.kernel.org/pub/linux/kernel/v\${MAJOR_VER}.x/linux-\${KERNEL_VER}.tar.xz
-          tar -xf linux-\${KERNEL_VER}.tar.xz
-          mv linux-\${KERNEL_VER} linux-source
-        "
 
-    - name: Configure kernel
-      run: |
-        su - builder -c "
-          set -e
-          cd /home/builder/repo/linux-source
-          
-          # Copy current Arch kernel config as base, or create a default one
-          zcat /proc/config.gz > .config 2>/dev/null || cp /boot/config-\$(uname -r) .config 2>/dev/null || make defconfig
-          
-          # Update config for current kernel version
+          # Update config for the current kernel version
           make olddefconfig
           
-          # Enable some commonly needed options
+          # Apply any custom settings
+          echo '--- Applying Custom Settings ---'
           scripts/config --enable CONFIG_IKCONFIG
           scripts/config --enable CONFIG_IKCONFIG_PROC
-          scripts/config --set-str CONFIG_LOCALVERSION \"-custom\"
+          scripts/config --set-str CONFIG_LOCALVERSION '-custom'
           
-          # Apply the configuration
+          # Apply the final configuration
           make olddefconfig
+          
+          # Determine the final kernel version string AFTER configuration
+          FINAL_KERNEL_VERSION=\$(make -s kernelrelease)
+          echo \"Final Kernel release version will be: \$FINAL_KERNEL_VERSION\"
+          
+          # Export the version for other steps
+          echo \"KERNEL_VERSION=\$FINAL_KERNEL_VERSION\" | sudo tee -a \$GITHUB_ENV > /dev/null
+          echo \"kernel_version_output=\$FINAL_KERNEL_VERSION\" | sudo tee -a \$GITHUB_OUTPUT > /dev/null
         "
 
     - name: Build kernel
       run: |
         su - builder -c "
           set -e
-          cd /home/builder/repo/linux-source
+          cd /home/builder/repo
           
-          # Get number of CPU cores for parallel compilation
           NPROC=\$(nproc)
-          echo \"Building with \$NPROC parallel jobs\"
+          echo \"Building with \$NPROC parallel jobs...\"
           
-          # Build kernel and modules
+          # Build kernel, modules, and install them to a temporary directory
           make -j\$NPROC
-          make -j\$NPROC modules
           
-          # Install modules to temporary directory
-          # Using sudo because builder doesn't own /tmp
-          sudo mkdir -p /tmp/kernel-install/lib/modules
+          echo \"Installing modules to /tmp/kernel-install...\"
           sudo make INSTALL_MOD_PATH=/tmp/kernel-install modules_install
           
-          # Copy kernel files
+          echo \"Copying kernel artifacts...\"
           sudo mkdir -p /tmp/kernel-install/boot
-          sudo cp arch/x86/boot/bzImage /tmp/kernel-install/boot/vmlinuz
-          sudo cp System.map /tmp/kernel-install/boot/
-          sudo cp .config /tmp/kernel-install/boot/config
-          
-          # Create kernel package info
-          KERNEL_VER=\$(make kernelrelease)
-          echo \"Kernel version: \$KERNEL_VER\" | sudo tee /tmp/kernel-install/kernel-info.txt > /dev/null
-          echo \"Build date: \$(date)\" | sudo tee -a /tmp/kernel-install/kernel-info.txt > /dev/null
-          echo \"Built on: \$(uname -a)\" | sudo tee -a /tmp/kernel-install/kernel-info.txt > /dev/null
+          sudo cp arch/x86/boot/bzImage /tmp/kernel-install/boot/vmlinuz-${{ steps.config_and_version.outputs.kernel_version_output }}
+          sudo cp System.map /tmp/kernel-install/boot/System.map-${{ steps.config_and_version.outputs.kernel_version_output }}
+          sudo cp .config /tmp/kernel-install/boot/config-${{ steps.config_and_version.outputs.kernel_version_output }}
         "
 
     - name: Create kernel archive
       run: |
-        # This step runs as root, which can read the temp files and write to /github/workspace
         set -e
         cd /tmp/kernel-install
         
-        # Get kernel version from the source tree for the filename
-        KERNEL_VER=$(cd /home/builder/repo/linux-source && make kernelrelease)
+        # The kernel version is now reliably set in the environment
+        echo "Packaging kernel version: ${{ env.KERNEL_VERSION }}"
         
-        # Create compressed archive directly in the workspace
-        tar -czf /github/workspace/arch-kernel-${KERNEL_VER}.tar.gz .
+        # Create compressed archive directly in the shared workspace
+        tar -czf /github/workspace/arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz .
         
-        # Create checksums in the workspace
         cd /github/workspace
-        sha256sum arch-kernel-${KERNEL_VER}.tar.gz > arch-kernel-${KERNEL_VER}.tar.gz.sha256
+        sha256sum arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz > arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz.sha256
         
-        # Set env vars for upload steps
-        echo "KERNEL_PACKAGE=arch-kernel-${KERNEL_VER}.tar.gz" >> $GITHUB_ENV
-        echo "KERNEL_CHECKSUM=arch-kernel-${KERNEL_VER}.tar.gz.sha256" >> $GITHUB_ENV
-
-    - name: Upload kernel artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: kernel-build
-        path: |
-          /github/workspace/arch-kernel-*.tar.gz
-          /github/workspace/arch-kernel-*.tar.gz.sha256
-        retention-days: 30
+        echo "KERNEL_PACKAGE=arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz" >> $GITHUB_ENV
+        echo "KERNEL_CHECKSUM=arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz.sha256" >> $GITHUB_ENV
 
     - name: Create Release
       id: create_release
@@ -173,30 +128,22 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ env.RELEASE_TAG }}-${{ env.KERNEL_VERSION }}-${{ github.run_number }}
-        release_name: Arch Linux Kernel ${{ env.KERNEL_VERSION }} (Build ${{ github.run_number }})
+        tag_name: ${{ env.RELEASE_TAG }}
+        release_name: Arch Linux Kernel ${{ env.KERNEL_VERSION }}
         body: |
           ## Arch Linux Kernel Build
           
           **Kernel Version:** `${{ env.KERNEL_VERSION }}`
-          **Build Date:** `${{ github.event.head_commit.timestamp }}`
+          **Git Tag:** `${{ env.RELEASE_TAG }}`
           **Commit:** `${{ github.sha }}`
           
           ### Installation Instructions
           
-          1. Download the kernel package (`arch-kernel-*.tar.gz`)
-          2. Verify the checksum with the provided `.sha256` file
-          3. Extract the archive: `sudo tar -xzf arch-kernel-*.tar.gz -C /`
-          4. Update bootloader configuration (e.g., `sudo grub-mkconfig -o /boot/grub/grub.cfg`)
-          5. Reboot and select the new kernel
-          
-          ### Files Included
-          - Kernel image (`vmlinuz`)
-          - Kernel modules
-          - System.map
-          - Kernel configuration
-          
-          **Note:** This is a pre-release build. Test thoroughly before using in production.
+          1. Download the kernel package (`arch-kernel-*.tar.gz`).
+          2. Verify the checksum with the provided `.sha256` file.
+          3. Extract the archive to root: `sudo tar -xzf arch-kernel-*.tar.gz -C /`
+          4. Update your bootloader (e.g., `sudo grub-mkconfig -o /boot/grub/grub.cfg`).
+          5. Reboot and select the new kernel.
         draft: false
         prerelease: true
 
@@ -222,8 +169,7 @@ jobs:
 
     - name: Build summary
       run: |
-        echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "## ✅ Build Summary" >> $GITHUB_STEP_SUMMARY
         echo "- **Kernel Version:** ${{ env.KERNEL_VERSION }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Package:** ${{ env.KERNEL_PACKAGE }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Release Tag:** ${{ steps.create_release.outputs.tag_name }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Build Status:** ✅ Success" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release:** [${{ env.RELEASE_TAG }}](${{ steps.create_release.outputs.html_url }})" >> $GITHUB_STEP_SUMMARY
