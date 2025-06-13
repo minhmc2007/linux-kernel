@@ -21,16 +21,12 @@ jobs:
       image: archlinux:latest
     
     steps:
-    # STEP 1: INSTALL DEPENDENCIES FIRST
-    # The container is minimal, so we must install git before we can use it.
     - name: Install Dependencies
       run: |
         pacman -Syu --noconfirm
         pacman -S --noconfirm git base-devel curl bc kmod inetutils xmlto python-sphinx python-sphinx_rtd_theme graphviz imagemagick
         pacman -S --noconfirm linux-headers pahole cpio perl tar xz libelf python-yaml
 
-    # STEP 2: CHECKOUT SOURCE CODE
-    # Now that git is installed, this will perform a proper 'git clone'.
     - name: Checkout Kernel Source
       uses: actions/checkout@v4
       with:
@@ -48,13 +44,13 @@ jobs:
         chown -R builder:builder /home/builder/.ccache
 
     - name: Configure kernel and Determine Version
+      # Give the step an ID so we can reference its outputs later
       id: config_and_version
       run: |
         su - builder -c "
           set -e
           cd /home/builder/repo
           
-          echo '--- Configuring Kernel ---'
           if [ -f .config ]; then
             echo 'Using existing .config file.'
           else
@@ -71,7 +67,8 @@ jobs:
           FINAL_KERNEL_VERSION=\$(make -s kernelrelease)
           echo \"Final Kernel release version will be: \$FINAL_KERNEL_VERSION\"
           
-          echo \"KERNEL_VERSION=\$FINAL_KERNEL_VERSION\" | sudo tee -a \$GITHUB_ENV > /dev/null
+          # This is the correct way to export a variable from a step.
+          # We write to GITHUB_OUTPUT, which is always available.
           echo \"kernel_version_output=\$FINAL_KERNEL_VERSION\" | sudo tee -a \$GITHUB_OUTPUT > /dev/null
         "
 
@@ -83,23 +80,37 @@ jobs:
           NPROC=\$(nproc)
           echo \"Building with \$NPROC parallel jobs...\"
           make -j\$NPROC
+          
           sudo make INSTALL_MOD_PATH=/tmp/kernel-install modules_install
+          
           sudo mkdir -p /tmp/kernel-install/boot
+          # Use the output from the previous step to name the files
           sudo cp arch/x86/boot/bzImage /tmp/kernel-install/boot/vmlinuz-${{ steps.config_and_version.outputs.kernel_version_output }}
           sudo cp System.map /tmp/kernel-install/boot/System.map-${{ steps.config_and_version.outputs.kernel_version_output }}
           sudo cp .config /tmp/kernel-install/boot/config-${{ steps.config_and_version.outputs.kernel_version_output }}
         "
 
     - name: Create kernel archive
+      id: archive
       run: |
         set -e
         cd /tmp/kernel-install
-        echo "Packaging kernel version: ${{ env.KERNEL_VERSION }}"
-        tar -czf /github/workspace/arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz .
+        
+        # Use the reliable step output here
+        KERNEL_VERSION="${{ steps.config_and_version.outputs.kernel_version_output }}"
+        echo "Packaging kernel version: ${KERNEL_VERSION}"
+        
+        PACKAGE_NAME="arch-kernel-${KERNEL_VERSION}.tar.gz"
+        CHECKSUM_NAME="${PACKAGE_NAME}.sha256"
+        
+        tar -czf "/github/workspace/${PACKAGE_NAME}" .
+        
         cd /github/workspace
-        sha256sum arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz > arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz.sha256
-        echo "KERNEL_PACKAGE=arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz" >> $GITHUB_ENV
-        echo "KERNEL_CHECKSUM=arch-kernel-${{ env.KERNEL_VERSION }}.tar.gz.sha256" >> $GITHUB_ENV
+        sha256sum "${PACKAGE_NAME}" > "${CHECKSUM_NAME}"
+        
+        # Set environment variables for the upload steps
+        echo "KERNEL_PACKAGE=${PACKAGE_NAME}" >> $GITHUB_ENV
+        echo "KERNEL_CHECKSUM=${CHECKSUM_NAME}" >> $GITHUB_ENV
 
     - name: Create Release
       id: create_release
@@ -107,12 +118,13 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
+        # Use the reliable step output for the release name
         tag_name: ${{ env.RELEASE_TAG }}-${{ github.run_number }}
-        release_name: Arch Linux Kernel ${{ env.KERNEL_VERSION }} (Build ${{ github.run_number }})
+        release_name: Arch Linux Kernel ${{ steps.config_and_version.outputs.kernel_version_output }} (Build ${{ github.run_number }})
         body: |
           ## Arch Linux Kernel Build
           
-          **Kernel Version:** `${{ env.KERNEL_VERSION }}`
+          **Kernel Version:** `${{ steps.config_and_version.outputs.kernel_version_output }}`
           **Git Ref Built:** `${{ env.RELEASE_TAG }}`
           **Commit:** `${{ github.sha }}`
           
@@ -143,7 +155,7 @@ jobs:
     - name: Build summary
       run: |
         echo "## ✅ Build Summary" >> $GITHUB_STEP_SUMMARY
-        echo "- **Kernel Version:** ${{ env.KERNEL_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Kernel Version:** ${{ steps.config_and_version.outputs.kernel_version_output }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Git Ref Built:** ${{ env.RELEASE_TAG }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Package:** ${{ env.KERNEL_PACKAGE }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Release:** [${{ env.RELEASE_TAG }}-${{ github.run_number }}](${{ steps.create_release.outputs.html_url }})" >> $GITHUB_STEP_SUMMARY
