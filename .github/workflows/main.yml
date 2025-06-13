@@ -9,7 +9,7 @@ on:
       git_ref:
         description: 'The tag, branch, or commit SHA to build'
         required: true
-        default: 'main'
+        default: 'master'
 
 env:
   RELEASE_TAG: ${{ github.event.inputs.git_ref || github.ref_name }}
@@ -25,7 +25,7 @@ jobs:
       run: |
         pacman -Syu --noconfirm
         pacman -S --noconfirm git base-devel curl bc kmod inetutils xmlto python-sphinx python-sphinx_rtd_theme graphviz imagemagick
-        pacman -S --noconfirm linux-headers pahole cpio perl tar xz libelf python-yaml
+        pacman -S --noconfirm pahole cpio perl tar xz libelf python-yaml
 
     - name: Checkout Kernel Source
       uses: actions/checkout@v4
@@ -33,7 +33,7 @@ jobs:
         ref: ${{ github.event.inputs.git_ref || github.ref }}
         fetch-depth: 0
 
-    - name: Setup build environment
+    - name: Setup Build Environment
       run: |
         useradd -m builder
         echo 'builder ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
@@ -43,8 +43,7 @@ jobs:
         mkdir -p /home/builder/.ccache
         chown -R builder:builder /home/builder/.ccache
 
-    - name: Configure kernel and Determine Version
-      # Give the step an ID so we can reference its outputs later
+    - name: Configure Kernel and Determine Version
       id: config_and_version
       run: |
         su - builder -c "
@@ -55,7 +54,7 @@ jobs:
             echo 'Using existing .config file.'
           else
             echo 'No .config found, creating default.'
-            zcat /proc/config.gz > .config 2>/dev/null || make defconfig
+            make defconfig
           fi
           
           make olddefconfig
@@ -67,12 +66,10 @@ jobs:
           FINAL_KERNEL_VERSION=\$(make -s kernelrelease)
           echo \"Final Kernel release version will be: \$FINAL_KERNEL_VERSION\"
           
-          # This is the correct way to export a variable from a step.
-          # We write to GITHUB_OUTPUT, which is always available.
-          echo \"kernel_version_output=\$FINAL_KERNEL_VERSION\" | sudo tee -a \$GITHUB_OUTPUT > /dev/null
+          echo \"kernel_version_output=\$FINAL_KERNEL_VERSION\" >> \$GITHUB_OUTPUT
         "
 
-    - name: Build kernel
+    - name: Build Kernel
       run: |
         su - builder -c "
           set -e
@@ -84,31 +81,30 @@ jobs:
           sudo make INSTALL_MOD_PATH=/tmp/kernel-install modules_install
           
           sudo mkdir -p /tmp/kernel-install/boot
-          # Use the output from the previous step to name the files
           sudo cp arch/x86/boot/bzImage /tmp/kernel-install/boot/vmlinuz-${{ steps.config_and_version.outputs.kernel_version_output }}
           sudo cp System.map /tmp/kernel-install/boot/System.map-${{ steps.config_and_version.outputs.kernel_version_output }}
           sudo cp .config /tmp/kernel-install/boot/config-${{ steps.config_and_version.outputs.kernel_version_output }}
         "
 
-    - name: Create kernel archive
+    - name: Create Kernel Archive
       id: archive
       run: |
         set -e
         cd /tmp/kernel-install
         
-        # Use the reliable step output here
         KERNEL_VERSION="${{ steps.config_and_version.outputs.kernel_version_output }}"
         echo "Packaging kernel version: ${KERNEL_VERSION}"
         
         PACKAGE_NAME="arch-kernel-${KERNEL_VERSION}.tar.gz"
         CHECKSUM_NAME="${PACKAGE_NAME}.sha256"
         
+        # Ensure the target directory exists and is writable
+        mkdir -p /github/workspace
         tar -czf "/github/workspace/${PACKAGE_NAME}" .
         
         cd /github/workspace
         sha256sum "${PACKAGE_NAME}" > "${CHECKSUM_NAME}"
         
-        # Set environment variables for the upload steps
         echo "KERNEL_PACKAGE=${PACKAGE_NAME}" >> $GITHUB_ENV
         echo "KERNEL_CHECKSUM=${CHECKSUM_NAME}" >> $GITHUB_ENV
 
@@ -118,8 +114,7 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        # Use the reliable step output for the release name
-        tag_name: ${{ env.RELEASE_TAG }}-${{ github.run_number }}
+        tag_name: build-${{ github.run_number }}
         release_name: Arch Linux Kernel ${{ steps.config_and_version.outputs.kernel_version_output }} (Build ${{ github.run_number }})
         body: |
           ## Arch Linux Kernel Build
@@ -132,7 +127,7 @@ jobs:
         draft: false
         prerelease: true
 
-    - name: Upload kernel package to release
+    - name: Upload Kernel Package to Release
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -142,20 +137,20 @@ jobs:
         asset_name: ${{ env.KERNEL_PACKAGE }}
         asset_content_type: application/gzip
 
-    - name: Upload checksum to release
+    - name: Upload Checksum to Release
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create_release.outputs.upload_url }}
         asset_path: /github/workspace/${{ env.KERNEL_CHECKSUM }}
-        asset_name: ${{ env.KERNEL_CHECKSUM }}
+        asset_name: ${ { env.KERNEL_CHECKSUM }}
         asset_content_type: text/plain
 
-    - name: Build summary
+    - name: Build Summary
       run: |
         echo "## ✅ Build Summary" >> $GITHUB_STEP_SUMMARY
         echo "- **Kernel Version:** ${{ steps.config_and_version.outputs.kernel_version_output }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Git Ref Built:** ${{ env.RELEASE_TAG }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Package:** ${{ env.KERNEL_PACKAGE }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Release:** [${{ env.RELEASE_TAG }}-${{ github.run_number }}](${{ steps.create_release.outputs.html_url }})" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release:** [build-${{ github.run_number }}](${{ steps.create_release.outputs.html_url }})" >> $GITHUB_STEP_SUMMARY
