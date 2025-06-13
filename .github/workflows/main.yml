@@ -1,22 +1,17 @@
 name: Build Arch Linux Kernel
 
 on:
-  # 1. This still triggers automatically when you push a new tag
   push:
     tags:
       - 'v*'
-  
-  # 2. This is the manual trigger, now with an input field
   workflow_dispatch:
     inputs:
       git_ref:
         description: 'The tag, branch, or commit SHA to build'
         required: true
-        # Defaults to the main branch if you run it manually
         default: 'main'
 
 env:
-  # Prioritize the manual input, otherwise use the git ref that triggered the run
   RELEASE_TAG: ${{ github.event.inputs.git_ref || github.ref_name }}
 
 jobs:
@@ -26,20 +21,21 @@ jobs:
       image: archlinux:latest
     
     steps:
-    # 3. This is the key change for manual runs
+    # STEP 1: INSTALL DEPENDENCIES FIRST
+    # The container is minimal, so we must install git before we can use it.
+    - name: Install Dependencies
+      run: |
+        pacman -Syu --noconfirm
+        pacman -S --noconfirm git base-devel curl bc kmod inetutils xmlto python-sphinx python-sphinx_rtd_theme graphviz imagemagick
+        pacman -S --noconfirm linux-headers pahole cpio perl tar xz libelf python-yaml
+
+    # STEP 2: CHECKOUT SOURCE CODE
+    # Now that git is installed, this will perform a proper 'git clone'.
     - name: Checkout Kernel Source
       uses: actions/checkout@v4
       with:
-        # This tells checkout to use the tag/branch from the input field
         ref: ${{ github.event.inputs.git_ref || github.ref }}
-        # Fetch all history so 'make kernelrelease' works correctly
         fetch-depth: 0
-
-    - name: Initialize Arch Linux environment
-      run: |
-        pacman -Syu --noconfirm
-        pacman -S --noconfirm base-devel git curl bc kmod inetutils xmlto python-sphinx python-sphinx_rtd_theme graphviz imagemagick
-        pacman -S --noconfirm linux-headers pahole cpio perl tar xz libelf python-yaml
 
     - name: Setup build environment
       run: |
@@ -111,8 +107,8 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ env.RELEASE_TAG }}
-        release_name: Arch Linux Kernel ${{ env.KERNEL_VERSION }}
+        tag_name: ${{ env.RELEASE_TAG }}-${{ github.run_number }}
+        release_name: Arch Linux Kernel ${{ env.KERNEL_VERSION }} (Build ${{ github.run_number }})
         body: |
           ## Arch Linux Kernel Build
           
@@ -150,4 +146,4 @@ jobs:
         echo "- **Kernel Version:** ${{ env.KERNEL_VERSION }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Git Ref Built:** ${{ env.RELEASE_TAG }}" >> $GITHUB_STEP_SUMMARY
         echo "- **Package:** ${{ env.KERNEL_PACKAGE }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Release:** [${{ env.RELEASE_TAG }}](${{ steps.create_release.outputs.html_url }})" >> $GITHUB_STEP_SUMMARY
+        echo "- **Release:** [${{ env.RELEASE_TAG }}-${{ github.run_number }}](${{ steps.create_release.outputs.html_url }})" >> $GITHUB_STEP_SUMMARY
